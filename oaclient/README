@@ -14,6 +14,8 @@ perfect but it made sense at the time.
 
 Known issues:
 
+This is a work in progress...
+
 1) There is no Windows port and all this stuff needs to eventually be
 cross platform.
 
@@ -24,12 +26,12 @@ right on NFS or anything but a loclaly mounted disk.
 think.  Need to work on that if this is to be independent.
 
 
-Dependencies
+Dependencies:
 
 1)      Cyrus SASL
         http://www.cyrusimap.org/
         SASL library framework with plugin API.  Used in CMU IMAP
-server and others.
+	server and others.
 
         License:
 http://www.cyrusimap.org/mediawiki/index.php/Downloads#Licensing
@@ -40,18 +42,16 @@ http://www.cyrusimap.org/mediawiki/index.php/Downloads#Licensing
 3)      LibCURL
         http://curl.haxx.se
         "libcurl is a free and easy-to-use client-side URL transfer
-library,
-        supporting DICT, FILE, FTP, FTPS, GOPHER, HTTP, HTTPS, IMAP,
-IMAPS, LDAP,
-        LDAPS, POP3, POP3S, RTMP, RTSP, SCP, SFTP, SMTP, SMTPS, TELNET
-and TFTP. ..."
+        library, supporting DICT, FILE, FTP, FTPS, GOPHER, HTTP,
+        HTTPS, IMAP, IMAPS, LDAP, LDAPS, POP3, POP3S, RTMP, RTSP, SCP,
+        SFTP, SMTP, SMTPS, TELNET and TFTP. ..." 
 
         License: http://curl.haxx.se/docs/copyright.html
 
 4)      Jansson JSON library
         http://www.digip.org/jansson/
         Jansson is a C library for encoding, decoding and manipulating
-JSON data.
+	JSON data.
 
         Jansson is licensed under the MIT license.
 
@@ -59,6 +59,12 @@ JSON data.
 
 	"Robin Gareus <robin@gareus.org> has written and is maintaining
 	liboauth."
+
+BUGS:
+
+1)	There's a bug that causes oaclient.db to have a correupted
+        filename, replacing the first few characters with junk.
+2)	Some unit tests still failing, notably, unit-sql_db.
 
 
 -----------------

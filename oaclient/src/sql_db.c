@@ -354,6 +354,9 @@ int oaclient_cache_update(struct oaclient_ctx *ctx,
     return OAC_BAD_PARAM;
 
   /* Begin our transaction */
+  if (!db)
+    return OAC_FAIL;
+
   sqlresult = sqlite3_prepare(db, "BEGIN;", -1, &stmt, &tail);
   sqlresult = sqlite3_step(stmt);
   sqlite3_finalize(stmt);
