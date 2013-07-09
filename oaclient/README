@@ -1,0 +1,70 @@
+The OAClient Library
+
+This is a library written to separate out the OAuth specifics from the
+SASL-OAUTH  stuff, and intended to become a standalone thing.  It 
+implements a SQLite cache of user credentials per user that are shared
+among all clients using the library.  This becomes important if you
+have multiple processes/threads that all need to authenticate and you
+only want to prompt the user once, so locking is handled through the
+library. 
+
+As such it's much like a Cyrus SASL plugin in that it takes callbaks
+for I/O with the user so the UI layer is abstracted away.  This isn't
+perfect but it made sense at the time.
+
+Known issues:
+
+1) There is no Windows port and all this stuff needs to eventually be
+cross platform.
+
+2) Locking relise on local filesystem locking, unknown if it will work
+right on NFS or anything but a loclaly mounted disk.
+
+3) Have not completely abstracted out the Cyrus SASL library yet I
+think.  Need to work on that if this is to be independent.
+
+
+Dependencies
+
+1)      Cyrus SASL
+        http://www.cyrusimap.org/
+        SASL library framework with plugin API.  Used in CMU IMAP
+server and others.
+
+        License:
+http://www.cyrusimap.org/mediawiki/index.php/Downloads#Licensing
+
+2)      OpenSSL
+        This has to be well known....
+
+3)      LibCURL
+        http://curl.haxx.se
+        "libcurl is a free and easy-to-use client-side URL transfer
+library,
+        supporting DICT, FILE, FTP, FTPS, GOPHER, HTTP, HTTPS, IMAP,
+IMAPS, LDAP,
+        LDAPS, POP3, POP3S, RTMP, RTSP, SCP, SFTP, SMTP, SMTPS, TELNET
+and TFTP. ..."
+
+        License: http://curl.haxx.se/docs/copyright.html
+
+4)      Jansson JSON library
+        http://www.digip.org/jansson/
+        Jansson is a C library for encoding, decoding and manipulating
+JSON data.
+
+        Jansson is licensed under the MIT license.
+
+4) 	liboauth-0.9.4
+
+	"Robin Gareus <robin@gareus.org> has written and is maintaining
+	liboauth."
+
+
+-----------------
+Copyright (c) 2013, Yahoo! Inc.  All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License"). You may
+obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0.
+See accompanying LICENSE file for terms.
+

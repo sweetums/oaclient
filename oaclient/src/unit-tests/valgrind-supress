@@ -1,0 +1,471 @@
+{
+   tunnel_curl_hdr_cb OK, stncascmp result
+   Memcheck:Cond
+   fun:tunnel_curl_hdr_cb
+}
+{
+   tunnel_curl_write_cb OK, stncascmp result
+   Memcheck:Cond
+   fun:tunnel_curl_wrt_cb
+}
+
+{
+   curl 10
+   Memcheck:Cond
+   fun:Curl_compareheader
+}
+{
+   curl 11
+   Memcheck:Cond
+   fun:index
+   fun:Curl_readwrite
+}
+{
+   curl 12
+   Memcheck:Cond
+   fun:Curl_http_auth_act
+}
+{
+   curl 13
+   Memcheck:Cond
+   fun:Curl_httpchunk_read
+}
+{
+   stdc 20
+   Memcheck:Value4
+   fun:____strtoul_l_internal
+   fun:__strtoul_internal
+}
+{
+   stdc 21
+   Memcheck:Cond
+   fun:____strtoul_l_internal
+}
+{
+   stdc 22
+   Memcheck:Cond
+   fun:strncpy
+}
+{
+   stdc 23
+   Memcheck:Cond
+   fun:strlen
+}
+{
+   stdc 24
+   Memcheck:Cond
+   fun:_IO_file_xsputn@@GLIBC_2.1
+}
+{
+   stdc 25
+   Memcheck:Cond
+   fun:strncmp
+}
+{
+   stdc 26
+   Memcheck:Param
+   write(buf)
+   fun:__write_nocancel
+}
+{
+   stdc 27 (strchr?)
+   Memcheck:Cond
+   fun:index
+}
+{
+   stdc 28 
+   Memcheck:Cond
+   fun:strnlen
+}
+{
+   curl 31
+   Memcheck:Cond
+   fun:Curl_http
+}
+{
+   curl 32
+   Memcheck:Cond
+   fun:Curl_client_write
+}
+{
+   curl 33
+   Memcheck:Value4
+   fun:Curl_httpchunk_read
+}
+{
+   curl 34
+   Memcheck:Cond
+   fun:Curl_pgrsUpdate
+}
+{
+   curl 35
+   Memcheck:Cond
+   fun:Curl_speedcheck
+}
+{
+   curl 36
+   Memcheck:Cond
+   fun:__divdi3
+   fun:Curl_pgrsUpdate
+}
+{
+   curl 37
+   Memcheck:Cond
+   fun:Curl_retry_request
+}
+{
+   curl 38
+   Memcheck:Cond
+   fun:Curl_http_done
+}
+{
+   stdc 39
+   Memcheck:Cond
+   fun:strstr
+}
+{
+   stdc 40
+   Memcheck:Cond
+   fun:_IO_str_overflow
+   fun:_IO_default_xsputn
+   fun:vfprintf
+}
+{
+   stdc 41
+   Memcheck:Cond
+   fun:_IO_default_xsputn
+   fun:vfprintf
+}
+{
+stdc 42
+   Memcheck:Cond
+   fun:Curl_http_input_auth
+}
+{
+ curl 43
+   Memcheck:Value4
+   fun:Curl_http_input_auth
+}
+{
+   CurlOpenssl1
+   Memcheck:Param
+   write(buf)
+   fun:__write_nocancel
+   fun:BIO_write
+   fun:ssl23_write_bytes
+   fun:ssl23_connect
+   fun:SSL_connect
+   fun:Curl_ossl_connect_common
+   fun:Curl_ossl_connect
+   fun:Curl_ssl_connect
+   fun:Curl_http_connect
+   fun:Curl_protocol_connect
+   fun:SetupConnection
+   fun:Curl_connect
+}
+{
+   AllOpensslValue4
+   Memcheck:Value4
+   fun:BN_num_bits_word
+}
+{
+   AES
+   Memcheck:Value4
+   fun:AES_set_encrypt_key
+}
+{
+   AES2
+   Memcheck:Value4
+   fun:AES_encrypt
+}
+{
+   AES2
+   Memcheck:Value4
+   obj:/lib/libcrypto.so.0.9.7a
+}
+{
+   libcryptWrite
+   Memcheck:Param
+   write(buf)
+   obj:/lib/libcrypto.so.0.9.7a
+}
+{
+   libcryptWrite
+   Memcheck:Param
+   write(buf)
+   fun:__write_nocancel
+   obj:/lib/libcrypto.so.0.9.7a
+}
+{
+   foo
+   Memcheck:Value4
+   fun:tls1_enc
+   fun:ssl3_read_bytes
+}
+{
+   foo2
+   Memcheck:Value4
+   fun:ssl3_read_bytes
+}
+{
+   foo3
+   Memcheck:Cond
+   fun:memcpy
+   fun:ssl3_read_bytes
+}
+{
+   foo4
+   Memcheck:Cond
+   fun:memset
+   fun:BUF_MEM_grow_clean
+   fun:ssl3_get_message
+}
+{
+   foo5
+   Memcheck:Value4
+   fun:memset
+   fun:BUF_MEM_grow_clean
+   fun:ssl3_get_message
+}
+{
+   foo5
+   Memcheck:Cond
+   fun:Curl_ossl_recv
+}
+{
+   foo6
+   Memcheck:Cond
+   fun:Curl_read
+}
+{
+   foo7
+   Memcheck:Cond
+   fun:Curl_readwrite
+}
+{
+   foo8
+   Memcheck:Cond
+   fun:memchr
+   fun:Curl_readwrite
+}
+{
+   foo9
+   Memcheck:Cond
+   fun:Curl_ssl_recv
+}
+{
+   foo10
+   Memcheck:Value4
+   fun:Curl_readwrite
+}
+{
+   stdc 1
+   Memcheck:Value4
+   fun:strncasecmp
+}
+{
+   stdc2
+   Memcheck:Cond
+   fun:rawmemchr
+   fun:_IO_str_init_static_internal
+   fun:vsscanf
+   fun:sscanf
+}
+{
+   stdc 4
+   Memcheck:Value4
+   fun:_IO_vfscanf
+   fun:vsscanf
+   fun:sscanf
+}
+{
+   stdc 12
+   Memcheck:Cond
+   fun:strncasecmp
+}
+{
+   curl 2
+   Memcheck:Cond
+   fun:index
+   fun:Curl_compareheader
+}
+{
+   curl 1
+   Memcheck:Value4
+   fun:Curl_compareheader
+}
+{
+   stdc 11
+   Memcheck:Cond
+   fun:strncasecmp
+}
+{
+   stdc 10
+   Memcheck:Cond
+   fun:____strtol_l_internal
+   fun:__strtol_internal
+   fun:atoi
+}
+{
+   stdc 9
+   Memcheck:Value4
+   fun:____strtol_l_internal
+   fun:__strtol_internal
+   fun:atoi
+}
+{
+   stdc 8
+   Memcheck:Cond
+   fun:____strtol_l_internal
+   fun:__strtol_internal
+   fun:_IO_vfscanf
+   fun:vsscanf
+}
+{
+   stdc 7
+   Memcheck:Value4
+   fun:____strtol_l_internal
+   fun:__strtol_internal
+   fun:_IO_vfscanf
+   fun:vsscanf
+   fun:sscanf
+}
+{
+   stdc 5
+   Memcheck:Cond
+   fun:_IO_sputbackc
+   fun:_IO_vfscanf
+   fun:vsscanf
+   fun:sscanf
+}
+{
+   stdc 3
+   Memcheck:Cond
+   fun:_IO_vfscanf
+   fun:vsscanf
+   fun:sscanf
+}
+{
+   AllOpensslCond
+   Memcheck:Cond
+   obj:/lib/libssl.so.0.9.7a
+}
+{
+   AllLibcryptoCond
+   Memcheck:Cond
+   obj:/lib/libcrypto.so.0.9.7a
+}
+{
+   CurlOpenssl3
+   Memcheck:Cond
+   fun:BN_bin2bn
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+   fun:Curl_ossl_connect_common
+   fun:Curl_ossl_connect
+   fun:Curl_ssl_connect
+   fun:Curl_http_connect
+}
+{
+   Curl4
+   Memcheck:Cond
+   fun:bn_sub_words
+   fun:bn_mul_recursive
+   fun:BN_mul
+   fun:BN_mod_mul_montgomery
+   fun:BN_mod_exp_mont
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+}
+{
+   Curl5
+   Memcheck:Cond
+   fun:BN_ucmp
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+   fun:Curl_ossl_connect_common
+   fun:Curl_ossl_connect
+   fun:Curl_ssl_connect
+   fun:Curl_http_connect
+}
+{
+   Curl6
+   Memcheck:Cond
+   fun:BN_ucmp
+   fun:BN_mod_exp_mont
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+   fun:Curl_ossl_connect_common
+   fun:Curl_ossl_connect
+   fun:Curl_ssl_connect
+}
+
+{
+   OpenSSL1
+   Memcheck:Cond
+   fun:bn_mul_recursive
+   fun:bn_mul_recursive
+   fun:BN_mul
+   fun:BN_mod_mul_montgomery
+   fun:BN_mod_exp_mont
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+}
+{
+   OpenSSL2
+   Memcheck:Cond
+   fun:bn_sub_words
+   fun:bn_mul_recursive
+   fun:bn_mul_recursive
+   fun:BN_mul
+   fun:BN_mod_mul_montgomery
+   fun:BN_mod_exp_mont
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+}
+{
+   OpenSSL3
+   Memcheck:Cond
+   fun:bn_cmp_words
+   fun:bn_mul_recursive
+   fun:BN_mul
+   fun:BN_mod_mul_montgomery
+   fun:BN_mod_exp_mont
+   obj:/lib/libcrypto.so.0.9.7a
+   fun:RSA_public_encrypt
+   obj:/lib/libssl.so.0.9.7a
+   fun:ssl3_connect
+   fun:SSL_connect
+   fun:ssl23_connect
+   fun:SSL_connect
+}
+

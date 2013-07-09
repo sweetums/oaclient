@@ -1,0 +1,1728 @@
+/* Oauth SASL plugin
+ * Bill Mills, Tim Showalter
+ * $Id:  $
+ *
+ * Copyright (c) 2011, Yahoo! Inc.
+ * All rights reserved.
+ */
+#define _GNU_SOURCE
+#define __USE_GNU      1
+
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+#include <curl/curl.h>
+#include <curl/easy.h>
+
+#include <oaclient.h>
+
+#include <curl/curl.h>
+#include <curl/easy.h>
+
+#include "endpoint.h"
+#include "tunnel.h"
+#include "sql_db.h"
+
+#include <oauth.h>
+
+#include <jansson.h>
+
+#ifndef DEBUG 
+#define DEBUG 0
+#endif 
+
+#define DEBUG_PRINTF(variable) if (DEBUG) printf(#variable " is %s\n\n", variable)
+#define DEBUG_PRINT(variable) if (DEBUG) printf(variable "\n")
+
+
+/* 
+ * temporary hard coded consumer key and secret (which isn't really secret in this case)
+ */
+/* XXXXXX need to load this from config */  
+
+const char *ydn_consumer_key = "dj0yJmk9aE9STTFoR29kNmM2JmQ9WVdrOVVrTjRNMU5JTkRRbWNHbzlNakF3TXpFNE5UWTJNZy0tJnM9Y29uc3VtZXJzZWNyZXQmeD1kOQ--";
+const char *ydn_consumer_secret = "cc36eaba8a9063f6fa7c43858320541c3236950a";
+
+
+#define STRNDUP(src, len) local_strndup(src, len)
+
+static
+char *local_strndup(const char *src, int len)
+{
+    char *dest = malloc(len + 1);
+    if (dest) {
+	strncpy(dest, src, len);
+	dest[len] = '\0';
+    }
+
+    return dest;
+}
+
+const char *SUPPORTED_FLOWS[] = {"YDN", "OAUTH", "OAUTH2", NULL};
+enum supported_flow{FLOW_UNKNOWN=-1, FLOW_YDN=0, FLOW_OAUTH, FLOW_OAUTH2};
+
+const char *SUPPORTED_SCHEMES[] = {"bearer", "mac", "oauth", NULL};
+enum supported_scheme{SCHEME_UNKNOWN=-1, SCHEME_BEARER=0, SCHEME_MAC, SCHEME_OAUTH};
+
+/*
+ * Used to clean up string returned by oaclient_* functions.
+ */
+void oaclient_free(void *mem)
+{
+    if (mem) free(mem);
+}
+
+/* oaclient_tunnel_endpoint
+ *
+ * Taking an enpoint and context, return the payload to send.  If there is 
+ * no stored credential then the payload is a discovery request.  If there
+ * is a cached credential this returns the access request for the resource.
+ *
+ * This will prompt for password if that's required for authentication, using 
+ * the callback passed in by the caller in the ctx.
+ *
+ * If discovery information is passed in, this presumes that the cached 
+ * credential is no longer valid.  If the cached credential has a short term 
+ * access token and a durable token,  the durable token is retried before the 
+ * user is prompted for authentication. 
+ *
+ * The oaclient_credential must be cleaned up with oaclient_credential_destroy().
+ * payload returned can be freed with oaclient_free().
+ */
+int oaclient_tunnel_endpoint(struct oaclient_ctx *ctx,
+			     char ** payload, 
+			     struct oaclient_credential **cred,
+			     struct oaclient_endpoint *endpoint, 
+			     const char *discovery)
+{
+    struct oaclient_credential *tmpcred;
+    struct oaclient_identity *ident;
+    char *out, *password;
+    int result=OAC_OK, expiry;
+    enum oaclient_ctx_state state = oaclient_ctx_get_state(ctx);
+    enum supported_flow flow;
+    const char *flowp;
+
+    ident = oaclient_credential_get_identity(*cred);
+
+    if (NULL == ctx) {
+      return OAC_BAD_PARAM;
+    }
+    struct oaclient_callback_args cbargs = {0, ctx->rock, ctx, ident};
+
+
+    if (discovery) {
+	/* 
+	 * In the new regime...  discovery communicates back a recommended scope
+	 * and error code in a JSON payload.  Actual auth endpoint discovery is
+	 * via WebFinger/Simple Web Discovery.
+	 *
+	 * If discovery is passed in current credentials if any probably need a refresh.
+	 * If that fails then we may need to rediscover.
+	 *
+	 * XXXXXXX How do we detect that cached discovery info for an endpoint
+	 * needs to be refreshed?
+	 *
+	 */
+	result = tunnel_parse_discovery(ctx, *cred, discovery);
+	if (OAC_OK != result)
+	    return result;
+
+	/* Update teh cache with the new discovery info */
+	oaclient_cache_update(ctx, endpoint, ident, NULL);
+
+	flowp = oaclient_identity_get_flow(ident);
+	if (flowp) {
+	    flow = find_strncase_index_inlist(SUPPORTED_FLOWS , flowp, strlen(flowp));
+	}
+	/*
+	 * OK, now we do the right thing based on what our previous state was.
+	 */
+	switch (state) {
+	case OACLIENT_STATE_TOKEN:
+	    /* Try a refresh */
+	    oaclient_cache_forget_credential(ctx, *cred);
+	    result = tunnel_refresh(ctx, *cred, flow,  NULL);
+	    switch (result) {
+	    case OAC_OK:
+		oaclient_ctx_set_state(ctx, OACLIENT_STATE_REFRESHED);
+		oaclient_cache_update(ctx, endpoint, ident, *cred);
+		break;
+	    case OAC_FAIL:
+		result = tunnel_auth_credentialed(ctx, *cred, endpoint, &out);
+		if (OAC_OK == result) {
+		    oaclient_ctx_set_state(ctx, OACLIENT_STATE_AUTHENTICATED);
+		}
+		break;
+	    default:
+		return result;
+ 	    }
+	    break;
+	case OACLIENT_STATE_REFRESHED:
+	    expiry = oaclient_credential_get_expiry(*cred);
+	    if ((OAC_OK == result) && 
+		((time(NULL) + OACLIENT_EXPIRY_SKEW) > expiry)) {
+		// it might have been a while...  if so, refresh again.
+		// but don't try this if we just refreshed above and failed.
+		oaclient_cache_forget_credential(ctx, *cred);
+		result = tunnel_refresh(ctx, *cred, flow,  NULL);
+		if (OAC_OK == result) {
+		  oaclient_cache_update(ctx, endpoint, ident, *cred);
+		} else {
+		  oaclient_ctx_set_state(ctx, OACLIENT_STATE_UNKNOWN);
+		}
+	    } else {
+		// if the token should be current, try a new auth.
+		oaclient_cache_forget_credential(ctx, *cred);
+		result = ctx->callbacks->askpass(&cbargs, &password);
+		if (OAC_OK != result) 
+		    return result;
+		
+		result = tunnel_authenticate(ctx, *cred, endpoint, flow, password);
+		if (OAC_OK == result) {
+		    oaclient_ctx_set_state(ctx, OACLIENT_STATE_AUTHENTICATED);
+		    oaclient_cache_update(ctx, endpoint, ident, *cred);
+		}
+		free(password);
+	    }
+	    break;
+
+	case OACLIENT_STATE_UNKNOWN:
+	case OACLIENT_STATE_DISCOVER:
+	case OACLIENT_STATE_AUTHENTICATED:
+	    // I'd like to know here how recently the last authentication happened.
+	    // This would let me figure out whter soemthign is fundamentally broken,
+	    // as a proxy use the token expiry time.  If we're gettign this case
+	    // when we think the token should be valid then we're hosed.
+	    expiry = oaclient_credential_get_expiry(*cred);
+	    if (OACLIENT_STATE_AUTHENTICATED != state ||
+		(NULL ==  oaclient_credential_get_token(*cred) ||
+		 (time(NULL) + OACLIENT_EXPIRY_SKEW) > expiry)) {
+		// assume we just need to re-auth
+		result = ctx->callbacks->askpass(&cbargs, &password);
+		if (OAC_OK != result) 
+		    return result;
+		
+		result = tunnel_authenticate(ctx, *cred, endpoint, flow, password);
+                if (OAC_OK == result) {
+		    oaclient_cache_update(ctx, endpoint, ident, *cred);
+		    oaclient_ctx_set_state(ctx, OACLIENT_STATE_AUTHENTICATED);
+                }
+		free(password);
+	    } else {
+		// re-authenticating is probably pointless
+		return OAC_FAIL;
+	    }
+	    break;
+	default:
+	    return OAC_FAIL;
+	}
+    } else {
+	/*
+	 * OK, no discovery means try to bootstrap.
+	*/
+	/* Endpoint -> Credential? */
+	result = oaclient_get_credential_for_endpoint(&tmpcred, ctx, endpoint);
+
+	switch (result) {
+	case OAC_OK:
+	    oaclient_ctx_set_state(ctx, OACLIENT_STATE_TOKEN);
+	    if (time(NULL) > oaclient_credential_get_expiry(tmpcred)) {
+		oaclient_cache_forget_credential(ctx, *cred);
+		result = tunnel_refresh(ctx, *cred, flow,  NULL);	    
+	    }
+	    if (OAC_OK != result) {
+		return tunnel_request_discovery(ctx, endpoint, &out);
+	    }
+	    break;
+	case OAC_FAIL:
+	    /* If we don't have anything stored... need basic doscovery info. */
+	    result = tunnel_request_discovery(ctx, endpoint, &out);	
+	    if (OAC_OK == result) {
+		oaclient_ctx_set_state(ctx, OACLIENT_STATE_UNKNOWN);
+		*payload = out;
+	    } 
+	    return result;
+	default:
+	    return result;
+	}
+    }
+
+    /* If we get here we should have a good credential to use. */
+    if (OAC_OK == result) {
+	result = tunnel_auth_credentialed(ctx, *cred, endpoint, &out);
+    }
+
+    if (OAC_OK == result) {
+	*payload = out;
+    } 
+    return result;
+}
+
+/**
+ * tunnel_authenticate
+ *
+ * Wrapper for the authenticate routines.  Determines
+ * which one needs to go and uses that.
+ */
+int tunnel_authenticate(struct oaclient_ctx *ctx,
+			struct oaclient_credential *cred,
+			struct oaclient_endpoint *ep,
+			int flow,
+			const char *password)
+{
+    const char *token;
+    int result;
+
+    /* 
+     * Do we have what we need? 
+     *
+     * Have we had a token before? If so then we need to purge it.
+     *
+     * XXXXXXX How do we discover if we have bad discovery info?
+     */
+    token = oaclient_credential_get_token(cred);
+    if (token) { 
+      oaclient_credential_reset(cred);
+    }
+
+    /* OK, go do it */    
+    switch (flow) {
+    case FLOW_YDN:
+	result = tunnel_ydn_authenticate(ctx, cred, ep, password);
+	break;
+    case FLOW_OAUTH2:
+	result = tunnel_oauth2_authenticate(ctx, cred, ep, password);
+	break;
+    case FLOW_OAUTH:
+	// OAuth 1.0 also doesn't have a simple password authentication,
+	// and this doesn't support browser auth.  (Browser auth for
+	// local applications will mean somethign like registering a URI
+	// handler locally for something like "oauthcallback:" which
+	// may or may not be worth it in the long run.  Local clients
+	// probably want OAuth 2.0 anyway.
+    default:
+	return OAC_FAIL;
+    }
+
+
+    return result;
+}
+
+/**
+ * tunnel_refresh
+ *
+ * Wrapper for the refresh logic.  Picks the right flow and
+ * uses that.  Takes a rock to throw to the YDN flow if needed.
+ */
+int tunnel_refresh(struct oaclient_ctx *ctx,
+		   struct oaclient_credential *cred,
+		   int flow,
+		   const char *rock)
+{
+    const char *token;
+    int result;
+
+    /* 
+     * Do we have what we need? Have we had a token before?
+     * If so then we can in fact try a refresh.
+     */
+    token = oaclient_credential_get_token(cred);
+    if (!token)
+	return OAC_NEED_INFO;   // this means do an auth.
+    
+    /* Try a refresh */
+    result = OAC_FAIL;
+    switch (flow) {
+    case FLOW_YDN:
+	result = tunnel_ydn_refresh(ctx, cred, NULL);
+	break;
+    case FLOW_OAUTH2:
+	result = tunnel_oauth2_refresh(ctx, cred);
+	break;
+    case FLOW_OAUTH:
+	// OAuth 1.0 doesn't have a "refresh" concept. Set up for new 
+	// authentication.  
+	//
+	// This is really a stub because we don't have a non-username/
+	// password auth in OAuth 1.0a.
+	//
+	// result = OAC_FAIL;
+    default:
+	return OAC_FAIL;
+    }
+
+    return result;
+}
+
+/*
+ *
+ */
+#define CURL_SETUP(easyhandle)   curl_easy_setopt(easyhandle, CURLOPT_POST, 1);	\
+    curl_easy_setopt(easyhandle, CURLOPT_HEADER, 0);                    \
+    curl_easy_setopt(easyhandle, CURLOPT_HEADERFUNCTION, tunnel_curl_hdr_cb); \
+    curl_easy_setopt(easyhandle, CURLOPT_WRITEFUNCTION, tunnel_curl_write_cb); \
+    curl_easy_setopt(easyhandle, CURLOPT_WRITEDATA, &curldata);		\
+    curl_easy_setopt(easyhandle, CURLOPT_HEADERDATA, &curldata);
+
+#define OAUTH2_TOKEN_REQ_FMT   "grant_type=password&client_id=%s&client_secret=%s&" \
+                               "username=%s&password=%s"
+#define OAUTH2_TOKEN_REFRESH_FMT  "grant_type=refresh_token&client_id=%s&"\
+                                  "client_secret=%s&refresh_token=%s"
+
+
+int tunnel_oauth2_parse_tokens(struct oaclient_ctx *ctx,
+			       struct oaclient_credential *cred,
+			       curl_data_t *curldata)
+{
+  int result=OAC_OK;
+  const char *token_type;
+  json_t *jobj, *jtmp;
+  json_error_t jerror;
+
+
+  /*
+  ** Find out if we succeeded.  Failure means going back for 
+  ** a new username/password.  That's done by the caller.
+  */
+  switch (curldata->code) {
+  case 401:
+    /* indicate password failure */
+    result = OAC_AUTH_FAIL;
+    break;
+  case 200:
+    /* A 200 OK in this case contains in the example
+    **
+    ** HTTP/1.0 200 OK
+    ** Content-Type: text/plain
+    ** 
+    ** RequestToken=jkdjkljsdflkjsfkjasldfkjsklfj0239423904jsdklfjklsdfjlasdkf
+    **
+    */
+    //    if (curldata->data && (NULL != (here = strstr(curldata->data, "\r\n\r\n")))) {
+    //      here += 4;
+    jobj = json_loads(curldata->data, &jerror);
+    if (!jobj) 
+      return OAC_FAIL;
+    /* */
+
+    jtmp = json_object_get(jobj, "token_type");
+    if (jtmp) {
+      token_type = json_string_value(jtmp);
+      oaclient_credential_set_scheme(cred, token_type);
+    } else {
+      json_object_clear(jobj);
+      return OAC_BADPROT;
+    }
+
+    jtmp = json_object_get(jobj, "access_token");
+    if (jtmp) {
+      oaclient_credential_set_token(cred, json_string_value(jtmp));
+    } else {
+      json_object_clear(jobj);
+      return OAC_BADPROT;
+    }
+    /* XXXXXXX need to add MAC token support here at some point */
+
+    /* returned refresh  token  is optional */
+    jtmp = json_object_get(jobj, "refresh_token");
+    if (jtmp) {
+      oaclient_credential_set_session(cred, json_string_value(jtmp));
+    }
+    /* returned scope is optional */
+    jtmp = json_object_get(jobj, "scope");
+    if (jtmp) {
+      oaclient_identity_set_scope(cred->ident, json_string_value(jtmp));
+    }
+    /* returned expiry is optional */
+    jtmp = json_object_get(jobj, "expires_in");
+    if (jtmp) {
+      oaclient_credential_set_expiry(cred, json_integer_value(jtmp));
+    }
+    json_object_clear(jobj);
+    // implicit result = OAC_OK;
+
+    break;
+  default:
+    /*    snprintf(errbuff, ERRBUFFLEN, 
+	  "Remote auth server returns HTTP code %d", text->curl.code);
+    */
+    result = OAC_FAIL;
+  }
+    
+  /* cleanup */
+  free(curldata->data);  
+  memset(curldata, 0, sizeof(*curldata));
+  
+  return result;
+}
+
+/**
+ * tunnel_oauth2_authenticate
+ *
+ * Do an Oauth 2 password credential authentication.
+ */
+int tunnel_oauth2_authenticate(struct oaclient_ctx *ctx,
+			       struct oaclient_credential *cred,
+			       struct oaclient_endpoint *ep,
+			       const char *password)
+{
+  struct oaclient_identity *ident = oaclient_credential_get_identity(cred);
+
+  int result=OAC_OK;
+
+  CURL *easyhandle = curl_easy_init();
+  char *reqfmt = OAUTH2_TOKEN_REQ_FMT;
+
+  char *safe_user, *safe_password;
+  char *postbuffer;
+  curl_data_t curldata;
+
+  memset(&curldata, 0, sizeof(curldata));
+  if (!ep->username || !password) 
+      return OAC_FAIL;
+
+  safe_user = curl_easy_escape(easyhandle, ep->username, 0);
+  safe_password = curl_easy_escape(easyhandle, password, 0);
+
+  /* Basic Curl setup */
+  CURL_SETUP(easyhandle);
+
+  /* create the post data for the curl call. */
+  if (-1 == asprintf(&postbuffer, reqfmt, ydn_consumer_key, ydn_consumer_secret, 
+		     safe_user, safe_password)) {
+    curl_easy_cleanup(easyhandle);
+    curl_free(safe_user);
+    curl_free(safe_password);
+    return OAC_NOMEM;
+  }
+  /* Set the form info */  
+  curl_easy_setopt(easyhandle, CURLOPT_URL, ident->authentication_url); 
+  curl_easy_setopt(easyhandle, CURLOPT_POSTFIELDS, postbuffer); 
+  curl_easy_perform(easyhandle); /* post away! */ 
+
+  /*
+  ** Find out if we succeeded.  Failure means going back for 
+  ** a new username/password.  That's done by the caller.
+  */
+  result = tunnel_oauth2_parse_tokens(ctx, cred, &curldata);
+    
+  /* cleanup */
+  free(postbuffer);
+  free(curldata.data);
+  curl_free(safe_user);
+  curl_free(safe_password);
+  curl_easy_cleanup(easyhandle);
+  
+  return result;
+}
+/**
+ * tunnel_oauth2_refresh
+ *
+ * Do an Oauth 2 credential refresh.
+ */
+int tunnel_oauth2_refresh(struct oaclient_ctx *ctx,
+			  struct oaclient_credential *cred)
+{
+  struct oaclient_identity *ident = oaclient_credential_get_identity(cred);
+
+  int result=OAC_OK;
+
+  CURL *easyhandle = curl_easy_init();
+  char *reqfmt = OAUTH2_TOKEN_REFRESH_FMT;
+
+  char *postbuffer;
+  curl_data_t curldata;
+
+  memset(&curldata, 0, sizeof(curldata));
+
+  /* Basic Curl setup */
+  CURL_SETUP(easyhandle);
+
+  /* create the post data for the curl call. */
+  if (-1 == asprintf(&postbuffer, reqfmt, ydn_consumer_key, 
+		     ydn_consumer_secret, cred->session)) {
+    curl_easy_cleanup(easyhandle);
+    return OAC_NOMEM;
+  }
+  /* Set the form info */  
+  curl_easy_setopt(easyhandle, CURLOPT_URL, ident->initiate_url); 
+  curl_easy_setopt(easyhandle, CURLOPT_POSTFIELDS, postbuffer); 
+  curl_easy_perform(easyhandle); /* post away! */ 
+
+  /*
+  ** Find out if we succeeded.  Failure means going back for 
+  ** a new username/password.  That's done by the caller.
+  */
+  result = tunnel_oauth2_parse_tokens(ctx, cred, &curldata);
+      
+    
+  /* cleanup */
+  free(postbuffer);
+  free(curldata.data);
+  curl_easy_cleanup(easyhandle);
+  
+  return result;
+}
+
+/**
+ * tunnel_ydn_authenticate
+ *
+ * Yahoo! YDN specific "Direct Oauth" authentication flow support.
+ *
+ * First get the "PART" token  and then turn that in for the cred.
+ *
+ * XXXXXXX We have an open issue with YDN, to whit: what client ID will we be using?  
+ * For the moment we'll use the test YDN App, but this will ned to get figured out.
+ */
+#define ERRBUFFLEN = 4096;
+#define YDN_PART_REQ_FMT   "oauth_consumer_key=%s&login=%s&passwd=%s"
+
+#define YDN_TOKEN_REQ_FMT  "oauth_consumer_key=%s&oauth_signature=%s%%26%s&" \
+                           "oauth_signature_method=PLAINTEXT&oauth_nonce=%d&" \
+                           "oauth_timestamp=%d&oauth_version=1.0&oauth_token=%s"
+
+#define YDN_TOKEN_REFRESH_FMT  YDN_TOKEN_REQ_FMT "&oauth_session_handle=%s&"
+
+#define YDN_PART_TOKEN_TAG    "RequestToken"
+#define YDN_OAUTH_TOKEN_TAG   "oauth_token"
+#define YDN_OAUTH_SECRET_TAG  "oauth_token_secret"
+#define YDN_OAUTH_SESSION_TAG "oauth_session_handle"
+#define YDN_OAUTH_EXPIRES_TAG "oauth_expires_in"
+
+
+
+int tunnel_ydn_authenticate(struct oaclient_ctx *ctx,
+			    struct oaclient_credential *cred,
+			    struct oaclient_endpoint *ep,
+			    const char *password)
+{
+  struct oaclient_identity *ident = oaclient_credential_get_identity(cred);
+
+  int result=OAC_OK;
+
+  CURL *easyhandle = curl_easy_init();
+  char *reqfmt = YDN_PART_REQ_FMT;
+
+  char *safe_user, *safe_password;
+  char *postbuffer, *ydnPART;
+  curl_data_t curldata;
+
+  memset(&curldata, 0, sizeof(curldata));
+  if (!ep->username || !password) 
+      return OAC_FAIL;
+
+  safe_user = curl_easy_escape(easyhandle, ep->username, 0);
+  safe_password = curl_easy_escape(easyhandle, password, 0);
+
+  /* Basic Curl setup */
+  CURL_SETUP(easyhandle);
+
+  /* create the post data for the curl call. */
+  if (-1 == asprintf(&postbuffer, reqfmt, ydn_consumer_key, safe_user, safe_password)) {
+    curl_easy_cleanup(easyhandle);
+    curl_free(safe_user);
+    curl_free(safe_password);
+    return OAC_NOMEM;
+  }
+  /* Set the form info */  
+    curl_easy_setopt(easyhandle, CURLOPT_URL, ident->initiate_url); 
+    curl_easy_setopt(easyhandle, CURLOPT_POSTFIELDS, postbuffer); 
+    //  TOKEN_CURL_SETUP(ident->initiate_url, postbuffer, tunnel_curl_hdr_cb, 
+    //	   tunnel_curl_write_cb, &curldata);
+  curl_easy_perform(easyhandle); /* post away! */ 
+
+  /* once we have an token we don't want the password anymore */
+  DEBUG_PRINT("Fetch PART");
+  DEBUG_PRINTF(postbuffer);
+  DEBUG_PRINTF(curldata.data);
+  free(postbuffer);
+
+  /*
+  ** Find out if we succeeded.  Failure means going back for 
+  ** a new username/password.  That's done by the caller.
+  */
+  switch (curldata.code) {
+  case 401:
+    /* indicate password failure */
+    result = OAC_AUTH_FAIL;
+    break;
+  case 200:
+    /* A 200 OK in this case contains in the example
+    **
+    ** HTTP/1.0 200 OK
+    ** Content-Type: text/plain
+    ** 
+    ** RequestToken=jkdjkljsdflkjsfkjasldfkjsklfj0239423904jsdklfjklsdfjlasdkf
+    **
+    */
+      if (curldata.data) {
+	  ydnPART = find_post_variable(curldata.data, YDN_PART_TOKEN_TAG);
+	  if (!ydnPART) {
+	      result = OAC_BADPROT;
+	  }
+      }
+      break;
+  default:
+      /*    snprintf(errbuff, ERRBUFFLEN, 
+	    "Remote auth server returns HTTP code %d", text->curl.code);
+      */
+      result = OAC_FAIL;
+  }
+
+  /*
+   * If we are OK to proceed, get the credentials. 
+   */
+  if (OAC_OK == result) {
+      result = tunnel_ydn_refresh(ctx, cred, ydnPART);
+  }
+  
+  /* cleanup */
+  free(ydnPART);
+  free(curldata.data);
+  curl_free(safe_user);
+  curl_free(safe_password);
+  curl_easy_cleanup(easyhandle);
+  
+  return result;
+}
+
+/*
+ * tunnel_ydn_refresh
+ *
+ * Called when we have a YDN style token and need to refresh it. It's 
+ * much the same as the last half of above, might end up being a simple
+ * refactoring....
+ *
+ * Yahoo! YDN specific "Direct Oauth" token refresh support..
+ *
+ * XXXXXXX We have an open issue with YDN, to whit: what client ID will we be using?  
+ * For the moment we'll use the test YDN App, but this will ned to get figured out.
+ */
+int tunnel_ydn_refresh(struct oaclient_ctx *ctx,
+		       struct oaclient_credential *cred,
+		       const char *ydnPART)
+{
+    struct oaclient_identity *ident = oaclient_credential_get_identity(cred);
+
+    int result = OAC_OK, result2;
+    int nonce = random();
+
+    CURL *easyhandle = curl_easy_init();
+
+    char *postbuffer, *reqfmt;
+    curl_data_t curldata;
+
+    memset(&curldata, 0, sizeof(curldata));
+
+    /* Basic Curl setup */
+    CURL_SETUP(easyhandle);
+
+    /* */
+    DEBUG_PRINT("ydn refresh/exchange PART for token.");
+    if (ydnPART) DEBUG_PRINTF(ydnPART);
+    /* create the post data for the curl call. */
+    if (ydnPART) {	
+	reqfmt = YDN_TOKEN_REQ_FMT;
+	result2 = asprintf(&postbuffer, reqfmt, 
+			   ydn_consumer_key, ydn_consumer_secret, "",
+			   nonce, (int)time(NULL), ydnPART);
+    } else {
+	reqfmt = YDN_TOKEN_REFRESH_FMT;
+	result2 = asprintf(&postbuffer, reqfmt, 
+			   ydn_consumer_key, ydn_consumer_secret, cred->secret,
+			   nonce, (int)time(NULL), cred->token, cred->session);
+    }
+    if (-1 == result2) {
+	free(curldata.data);
+	curl_easy_cleanup(easyhandle);
+	return OAC_NOMEM;
+    }
+    /* Set the form info */      
+    curl_easy_setopt(easyhandle, CURLOPT_URL, ident->refresh_url); 
+    curl_easy_setopt(easyhandle, CURLOPT_POSTFIELDS, postbuffer); 
+    
+    curl_easy_perform(easyhandle); /* post away! */ 
+    
+    DEBUG_PRINTF(postbuffer);  
+    DEBUG_PRINTF(curldata.data);  
+    free(postbuffer);
+    // Now parse out the things we need.
+    if (curldata.data && curldata.data[0]) {	
+	char *parse_token   = find_post_variable(curldata.data, YDN_OAUTH_TOKEN_TAG);
+	char *parse_secret  = find_post_variable(curldata.data, YDN_OAUTH_SECRET_TAG);
+	char *parse_session = find_post_variable(curldata.data, YDN_OAUTH_SESSION_TAG);
+	char *parse_expires = find_post_variable(curldata.data, YDN_OAUTH_EXPIRES_TAG);
+    
+	if (parse_token && parse_secret && parse_session && parse_expires) {
+	    // We can proceed
+	    oaclient_credential_set_token(cred, parse_token);
+	    oaclient_credential_set_secret(cred, parse_secret);
+	    oaclient_credential_set_session(cred, parse_session);
+	    oaclient_credential_set_expiry(cred, atoi(parse_expires));
+	} else {
+	    result = OAC_FAIL;
+	}
+	free(parse_token);
+	free(parse_secret);
+	free(parse_session);
+	free(parse_expires);
+    }
+    
+    /* cleanup */
+    free(curldata.data);
+    curl_easy_cleanup(easyhandle);
+
+    return result;
+}
+
+
+/** 
+ * curl related utilities
+ *
+ * Small stuff we need for parsing.
+ */
+
+/*
+** tunnel_curl_write_cb
+**
+**   Called once per header line.  Allocates space for the body of the
+**   returned data.  Parses the HTTP result code.
+**
+** tunnel_curl_write_cb
+**
+** Catches the data read by CURL
+**
+** XXXXXXXX Note that we're assuming that we'll have Content-Length.
+** This probably needs to be fixed.
+*/
+size_t tunnel_curl_hdr_cb(void *buffer, size_t size, 
+				  size_t nmemb, void *userp) {
+  curl_data_t *curldata = userp;
+  int sizeN = size * nmemb;
+  char *buff = buffer;
+
+  if (0 == strncmp("HTTP/1.1 ", buff, 8)) {
+    if (curldata->data) {
+      free(curldata->data);
+      memset(curldata, 0, sizeof(curl_data_t));
+    }
+    curldata->code = atoi(buff+8);
+  }
+
+  if (0 == strncmp("Content-Length: ", buff, 16)) {
+    curldata->size = atoi(buff+16);
+    curldata->data = malloc(curldata->size +1);
+    if (NULL == curldata->data) return 0;
+    memset(curldata->data, 0, curldata->size);
+  }
+
+  return sizeN;
+}
+
+size_t tunnel_curl_write_cb( void *buffer, size_t size, size_t nmemb, void *userp) {
+  curl_data_t *curldata = userp;
+  char *buff = buffer;
+  int sizeN = size * nmemb;
+  int newsize = 0, minsize;
+
+  /* make sure we have space for the new data */
+  if (NULL == curldata->data || 
+      0 == curldata->size || 
+      sizeN > (curldata->size - curldata->offset - 1)) {
+    for (minsize = curldata->offset + sizeN; 
+	 newsize < minsize; 
+	 newsize += 4096);
+    curldata->data = realloc(curldata->data, newsize);
+  }
+
+  if (curldata->data) {
+    strncpy(curldata->data + curldata->offset, buff, sizeN);
+    curldata->offset += sizeN;
+    curldata->data[sizeN] = 0;
+  }
+
+  return sizeN;
+}
+
+
+/** 
+ * parser utilities
+ *
+ * Small stuff we need for parsing.
+ */
+
+/*
+ * This one finds and returns a new string for the value of the
+ * post variable in the haystack.
+ */
+char *find_post_variable(char *haystack, char *name)
+{
+    char *result = NULL;
+    char *apos=NULL, *bpos, *cpos, *padded_name;
+    int len = strlen(name);
+
+    asprintf(&padded_name, "&%s=", name);
+
+    if (!padded_name)
+	return NULL;
+
+    if ((!strncmp(haystack, name, len)) &&
+	'=' == haystack[len]) {
+	apos = haystack + len + 1;
+    } else {
+	apos = strstr(haystack, padded_name);
+	if (!apos) {
+	    free(padded_name);
+	    return NULL;
+	}
+	apos += len + 2;
+    }
+    bpos = strchr(apos, '&');
+    cpos = strchr(apos, '\n');
+    if (!bpos && !cpos) {
+	result = strdup(apos);
+    } else {
+      if (bpos && (NULL == cpos || bpos<cpos)) {
+	    result = strndup(apos, bpos - apos);
+	} else {
+	    result = strndup(apos, cpos - apos);
+	}
+    }
+
+    free(padded_name);
+    return result;
+}
+
+char *findstr_a_before_b(char *haystack, char *a, char *b)
+{
+    char *result = NULL;
+    char *apos, *bpos;
+
+    apos = strstr(haystack, a);
+    if (apos) {
+	haystack += strlen(a);
+	bpos = strstr(apos, b);
+	if (bpos && apos < bpos)
+	    result = apos;
+    }
+    return result;
+}
+
+char *findchr_a_before_b(char *haystack, char a, char b)
+{
+    char *result = NULL;
+    char *apos, *bpos;
+
+    apos = strchr(haystack, a);
+    if (apos) {
+        bpos = strchr(haystack, b);
+        if (bpos && apos < bpos)
+            result = apos;
+    }
+    return result;
+}
+
+/**
+ * skip_quoted_string
+ *
+ * Finds and returns the position of the close quote of a quoted
+ * string, or the haystack if no quoted string is found.  NULL is
+ * returned if there is a format error or no end quote.
+ */
+char *skip_quoted_string(char *haystack, char *open, char *close, char *escaped_close)
+{
+    char *apos, *bpos;
+
+    apos = strstr(haystack, open);
+    if (!apos) 
+	return haystack;
+
+    /* skip quoted closes */
+    while (NULL != (bpos = findstr_a_before_b(apos, escaped_close, close))) {
+	apos = bpos + strlen(escaped_close);
+    }
+
+    return strstr(apos, close);
+}
+
+char *find_unquoted_string(char *haystack, char *needle, char *open, 
+			   char *close, char *escaped_close)
+{
+    char *apos, *openpos, *here = haystack;
+
+    /* quick sanity check. */
+    if (NULL == (apos = strstr(here, needle)) || 
+	!strcmp(needle, open) || 
+	!strcmp(needle, close) || 
+	!strcmp(needle, escaped_close))
+	return NULL;
+
+    while (apos) {
+	openpos = strstr(here, open);
+	if (!openpos || apos < openpos)
+	    break;
+
+	here = skip_quoted_string(openpos, open, close, escaped_close);
+	if (NULL == here) 
+	    break;
+
+	here++;
+	if (apos < here)
+	    apos = strstr(here, needle);
+    }
+ 
+    return apos;
+}
+
+
+const char *find_strncase_inlist(const char*list[], char *needle, int len)
+{
+    const char *this;
+    int i=0;
+    for (this = list[i]; this; this=list[++i]) {
+	if (0 == strncasecmp(this, needle, len))
+	    break;
+    }
+    return this;
+}
+
+int find_strncase_index_inlist(const char*list[], const char *needle, int len)
+{
+    const char *this;
+    int i=0;
+    if (!list || !needle)
+	return -1;
+    for (this = list[i]; this; this=list[++i]) {
+	if (0 == strncasecmp(this, needle, len))
+	    return i;
+    }
+    return -1;
+}
+
+
+/**
+ * Link header parsing routines.
+ *
+ *
+ */
+#define PARSE_LINK_STRING       "\r\nLink:"
+#define PARSE_LINK_SEP          ","
+#define PARSE_LINK_CRLF         "\r\n"
+#define PARSE_LINK_QUOTE        "\""
+#define PARSE_LINK_ESCQUOTE     "\\\""
+#define PARSE_LINK_FIELD_SEP    ";"
+#define PARSE_LINK_URI_START    "<"
+#define PARSE_LINK_URI_END      ">"
+#define PARSE_LINK_FIELD_SCHEME "scheme=\""
+#define PARSE_LINK_FIELD_REL    "rel=\""
+
+#define PARSE_TYPE_INIT      0
+#define PARSE_TYPE_AUTH      1
+#define PARSE_TYPE_REFRESH   2
+
+
+
+
+int tunnel_store_link(struct oaclient_ctx *ctx,
+		      struct oaclient_credential *cred,
+		      const char *payload,
+		      int type)
+{
+    struct oaclient_identity* who = cred->ident;
+
+    if (!cred || !cred->ident) return OAC_FAIL;
+
+    switch (type) {
+    case PARSE_TYPE_INIT:
+	return oaclient_identity_set_initiate_url(who, payload);
+    case PARSE_TYPE_AUTH:
+	return oaclient_identity_set_authentication_url(who, payload);
+    case PARSE_TYPE_REFRESH:
+	return oaclient_identity_set_refresh_url(who, payload);
+    }
+
+    return OAC_FAIL;
+}
+
+int tunnel_store_linkn(struct oaclient_ctx *ctx,
+		       struct oaclient_credential *cred,
+		       const char *payload,
+		       int type,
+		       int size)
+{
+
+    char *foo;
+    foo = local_strndup(payload, size);
+
+    int result; 
+    if (NULL == foo)
+	return OAC_NOMEM;
+
+    result = tunnel_store_link(ctx, cred, foo, type);
+    free(foo);
+
+    return result;
+}
+/*
+ * 
+ *
+ *
+ * Note that while teh spec supports mltiple links per line the 
+ * formal sytax doesn't define properly the use of the comma as
+ * a separator.  
+ */
+int tunnel_parse_link(struct oaclient_ctx *ctx,
+		      struct oaclient_credential *cred,
+		      const char *payload,
+		      const char *scheme,
+		      const char *rel,
+		      int type)
+{
+    const char *thislink = payload;
+    char *uri, *linksep, *eov, *eol, *lscheme, *lrel;
+    int urilen;
+
+    eol = strstr(payload, PARSE_LINK_CRLF);
+    if (NULL == eol)
+	return OAC_BADPROT;
+
+    while (thislink < eol) {
+	/* find if we have a multiple link */
+	linksep = find_unquoted_string((char*)thislink, PARSE_LINK_SEP, PARSE_LINK_QUOTE,
+				       PARSE_LINK_QUOTE, PARSE_LINK_ESCQUOTE);
+	if (NULL == linksep) {
+	    linksep = eol;
+	}
+
+	/* first find the URI */
+	uri = strstr(thislink, PARSE_LINK_URI_START);
+	if (NULL == uri) 
+	    return OAC_BADPROT;
+	uri++;
+
+	eov = find_unquoted_string((char*)thislink, PARSE_LINK_URI_END, PARSE_LINK_QUOTE,
+				   PARSE_LINK_QUOTE, PARSE_LINK_ESCQUOTE);
+	if (eov > linksep) 
+	    return OAC_BADPROT;
+	urilen = eov - uri;
+
+	/* check if the rel type is right */
+	lrel = strstr(thislink, PARSE_LINK_FIELD_REL);
+	if (NULL == lrel || lrel > linksep)
+	    return OAC_BADPROT;
+
+	lrel += strlen(PARSE_LINK_FIELD_REL);
+	if (!strncasecmp(lrel, rel, strlen(rel)) && lrel[strlen(rel)] == PARSE_LINK_QUOTE[0]) {
+
+	    /* now check if we are either no scheme or a macth */
+	    lscheme = strstr(thislink, PARSE_LINK_FIELD_SCHEME); 
+	    if (!lscheme || 
+		lscheme > linksep ||
+		(!strncasecmp(lscheme +strlen(PARSE_LINK_FIELD_SCHEME), scheme, strlen(scheme)) &&
+		 lscheme[strlen(scheme) + strlen(PARSE_LINK_FIELD_SCHEME)] == PARSE_LINK_QUOTE[0])) {
+		/* the above is: no scheme modifier in this link OR teh scheme matches */
+		return tunnel_store_linkn(ctx, cred, uri, type, urilen);
+	    }
+	}
+
+	thislink = linksep + 1;
+    } // end while 
+    /* if we get here we failed to find a matching link in this header */
+    return OAC_FAIL;
+}
+
+int tunnel_parse_links(struct oaclient_ctx *ctx,
+		       struct oaclient_credential *cred,
+		       const char *payload,
+		       const char *scheme,
+		       const char *rel,
+		       int type)
+{
+    char *linkhdr;
+    int result;
+
+    linkhdr = strstr(payload, PARSE_LINK_STRING);
+    while (linkhdr) {
+	linkhdr += strlen(PARSE_LINK_STRING);
+	result = tunnel_parse_link(ctx, cred, linkhdr, scheme, rel, type);
+	if (OAC_FAIL != result)
+	    return result;
+	linkhdr = strstr(linkhdr, PARSE_LINK_STRING);
+    }
+    return OAC_FAIL;
+}
+
+#define PARSE_LINK_OAINIT    "oauth-initiate"
+#define PARSE_LINK_OAAUTH    "oauth-authorize"
+#define PARSE_LINK_OATOKEN   "oauth-token"
+
+#define PARSE_LINK_OAINIT_REL    "rel=\"" PARSE_LINK_OAINIT "\""
+#define PARSE_LINK_OAAUTH_REL    "rel=\"" PARSE_LINK_OAAUTH "\""
+#define PARSE_LINK_OATOKEN_REL   "rel=\"" PARSE_LINK_OATOKEN "\""
+
+
+int tunnel_parse_oauth_links(struct oaclient_ctx *ctx,
+			    struct oaclient_credential *cred,
+			    const char *payload,
+			    const char *scheme)
+{
+    char *oainit, *oaauth, *oatoken;
+    int result;
+
+    oainit = strstr(payload, PARSE_LINK_OAINIT_REL);
+    oaauth = strstr(payload, PARSE_LINK_OAAUTH_REL);
+    oatoken = strstr(payload, PARSE_LINK_OATOKEN_REL);
+
+    if (!oainit || !oaauth || !oatoken)
+	return OAC_BADPROT;
+
+    result = tunnel_parse_links(ctx, cred, payload, scheme,
+                                PARSE_LINK_OAINIT, PARSE_TYPE_INIT);
+    if (OAC_OK != result)
+        return result;
+
+    result = tunnel_parse_links(ctx, cred, payload, scheme,
+                                PARSE_LINK_OAAUTH, PARSE_TYPE_AUTH);
+    if (OAC_OK != result)
+        return result;
+
+    result = tunnel_parse_links(ctx, cred, payload, scheme,
+                                PARSE_LINK_OATOKEN, PARSE_TYPE_REFRESH);
+
+    return result;
+
+}
+
+#define PARSE_LINK_OA2AUTH        "oauth2-authenticator"
+#define PARSE_LINK_OA2TOKEN       "oauth2-token"
+
+#define PARSE_LINK_OA2AUTH_REL    "rel=\"" PARSE_LINK_OA2AUTH   "\""
+#define PARSE_LINK_OA2TOKEN_REL   "rel=\"" PARSE_LINK_OA2TOKEN  "\""
+
+
+int tunnel_parse_oauth2_links(struct oaclient_ctx *ctx,
+		      struct oaclient_credential *cred,
+		      const char *payload,
+		      const char *scheme)
+{
+    char *oaauth, *oatoken;
+    int result;
+
+    oaauth = strstr(payload, PARSE_LINK_OA2AUTH_REL);
+    oatoken = strstr(payload, PARSE_LINK_OA2TOKEN_REL);
+
+    if (!oaauth || !oatoken)
+	return OAC_BADPROT;
+
+    result = tunnel_parse_links(ctx, cred, payload, scheme, 
+				PARSE_LINK_OA2AUTH, PARSE_TYPE_AUTH);
+    if (OAC_OK != result)
+	return result;
+
+    result = tunnel_parse_links(ctx, cred, payload, scheme, 
+				PARSE_LINK_OA2TOKEN, PARSE_TYPE_REFRESH);
+    
+    return result;
+}
+
+/**
+ * tunnel_request_discovery
+ *
+ * Generates the HTTP payload to request discovery information.
+ */
+/*
+** N.B. that post, path, and query are reserved for future use.
+*/
+#define KV_SEPCHAR              0x1                            
+#define KV_SEP                  "\x1"                            
+typedef enum {KV_HOST, KV_PORT, KV_AUTH, KV_POST, KV_PATH, KV_QUERY} KVINDEX_ENUM;
+const char* KV_STRINGS[] = {"host", "port", "auth", "post", "path", "query"};
+
+#define TUNNEL_REQ_FMT          ("auth=%s" KV_SEP "host=%s" KV_SEP "port=%d" KV_SEP KV_SEP)
+
+
+int tunnel_request_discovery(struct oaclient_ctx *ctx,
+                             struct oaclient_endpoint *where,
+                             char **payload)
+{
+    // const char *name = oaclient_endpoint_get_username(where);
+    // const char *path = oaclient_endpoint_get_path(where);
+
+    const char *host = oaclient_endpoint_get_hostname(where);
+    int  port = oaclient_endpoint_get_port(where);
+
+    char *outp;
+
+    *payload = NULL;
+
+    if ((!payload) || !host || port <= 0)
+	return OAC_FAIL;
+
+    /* Request with a null credential, we send host and port in case the server cares. */
+    asprintf(&outp, TUNNEL_REQ_FMT, "", host, port);
+    if (NULL == outp)
+	return OAC_NOMEM;
+
+    *payload = outp;
+
+    return OAC_OK;
+}
+
+
+#define HTTP_RPY_1_1           "HTTP/1.1 "
+#define WWW_AUTHENTICATE       "\r\nWWW-Authenticate: "
+
+/**
+ * tunnel_parse_discovery
+ *
+ * Parse an HTTP blob which should contain discovery information.
+ */
+int tunnel_parse_discovery(struct oaclient_ctx *ctx,
+			     struct oaclient_credential *cred,
+                             const char *payload)
+{
+    struct oaclient_identity *who = cred->ident;
+    int ecode, result;
+    char *tmpstr, *eolstr, *valstr, *eov;
+    const char *scope;
+    enum supported_scheme knownscheme;
+    int schemelen, realmlen;
+    int scopelen = -1;          /* bogus value silences compiler warning */
+
+    json_t *jobj, *jtmp;
+    json_error_t jerror;
+
+
+    /*
+     * Sanity check
+     */
+    if (NULL == payload || 0 == payload[0])
+	return OAC_BAD_PARAM; 
+    
+    /* Grab the JSON */ 
+    jobj = json_loads(payload, &jerror);
+    if (!jobj) 
+      return OAC_FAIL;
+
+    /* Get error and scope */
+
+    jtmp = json_object_get(jobj, "error");
+    if (jtmp) {
+      ecode = json_integer_value(jtmp);
+    } else {
+      json_object_clear(jobj);
+      return OAC_BADPROT;
+    }
+
+    jtmp = json_object_get(jobj, "scope");
+    if (jtmp) {
+      scope = json_string_value(jtmp);
+      oaclient_credential_set_scheme(cred, scope);
+    } 
+
+    /* 
+    ** Now, having the error code and string we can do work. Being
+    ** detail oriented here for supporting new returns that might 
+    ** creep in.
+    **
+    ** N.B. that the 400 return code is actually handled at the SASL
+    ** level, we don't need it here.
+    */
+    switch (ecode) {
+    case 401: /* invalid-token and expired-token */
+    case 403: /* right now this is only insufficient-scope */
+      /* 
+      ** So we have an invalid token or scope, which is what we can deal with.
+      */
+	break;
+    default:
+      return OAC_BADPROT;
+    }
+
+    /* 
+     * What we're interested in are the LINK headers and WWW-Authenticate 
+     * headers. We'll need to pick one we can support, and then look for the
+     * LINK headers to provide the URL endpoints we need.
+     *
+     * We need to find a WWW-Authenticate header we support.
+     */
+
+    if (NULL == (tmpstr = strstr(payload, WWW_AUTHENTICATE)))
+	return OAC_BADPROT;
+
+    while (tmpstr) {
+
+	tmpstr += strlen(WWW_AUTHENTICATE);
+	if (NULL == (eolstr = strstr(tmpstr, "\r\n")))
+	    return OAC_BADPROT;
+
+	/* now we get the returned scheme name in this header */
+	scheme = tmpstr;
+	eov = findchr_a_before_b(scheme, ' ', '\n');
+	if (NULL == eov)
+	    return OAC_BADPROT;
+	schemelen = (eov - scheme);
+
+
+	/* get the realm */
+	realm = findstr_a_before_b(tmpstr, "realm=\"", "\r\n");
+	if (NULL == realm)
+	    return OAC_BADPROT;
+	realm += strlen("realm=\"");
+        eov = findchr_a_before_b(realm, '"', '\n');
+        if (NULL == eov)
+            return OAC_BADPROT;
+        realmlen = (eov - realm);
+
+	/* get the OPTIONAL scope */
+	scope = findstr_a_before_b(tmpstr, "scope=\"", "\r\n");
+	if (scope) {
+	    scope += strlen("scope=\"");
+	    eov = findchr_a_before_b(scope, '"', '\n');
+	    if (NULL == eov)
+		return OAC_BADPROT;
+	    scopelen = (eov - scope);
+	}
+
+
+	/* Did we find one we know? */
+	knownscheme = find_strncase_index_inlist(SUPPORTED_SCHEMES, scheme, schemelen);
+	if (-1 != knownscheme)
+	    break;
+	
+	/* increment tmpstr */
+	eov = NULL;
+	tmpstr = strstr(tmpstr, WWW_AUTHENTICATE);
+    } // endwhile 
+
+    /* Now we'll need to get the LINKs based on what scheme we have */
+    switch (knownscheme) {
+    case SCHEME_UNKNOWN:
+	/* sanity check, need to have found something. */
+ 	return OAC_NO_SCHEMES;           
+    case SCHEME_OAUTH:
+        oaclient_identity_set_flow(who, SUPPORTED_FLOWS[FLOW_YDN]);
+ 	result = tunnel_parse_oauth_links(ctx,
+					  cred,
+					  payload,
+					  SUPPORTED_SCHEMES[knownscheme]);
+	break;
+    default:
+        oaclient_identity_set_flow(who, SUPPORTED_FLOWS[FLOW_OAUTH2]);
+	result = tunnel_parse_oauth2_links(ctx,
+					   cred,
+					   payload,
+					   SUPPORTED_SCHEMES[knownscheme]);
+	break;
+    }
+
+    /* take what we found and populate stuff */
+
+    if (OAC_OK == result) {
+	valstr = local_strndup(scheme, schemelen);
+	oaclient_credential_set_scheme(cred, valstr);
+	free(valstr);
+
+	valstr = local_strndup(realm, realmlen);
+	oaclient_identity_set_realm(who, valstr);
+	free(valstr);
+
+	if (scope) {
+	    valstr = local_strndup(scope, scopelen);
+	    oaclient_identity_set_scope(who, valstr);
+	    free(valstr);
+	}
+    }
+
+    return result;
+}
+
+/**
+ *
+ *
+ */
+int tunnel_auth_credentialed(struct oaclient_ctx *ctx,
+			     struct oaclient_credential *cred,
+                             struct oaclient_endpoint *ep,
+			     char **out)
+{
+    enum supported_flow scheme;
+    const char *schemep = oaclient_credential_get_scheme(cred);
+
+    scheme = find_strncase_index_inlist(SUPPORTED_SCHEMES, schemep, strlen(schemep));
+    switch (scheme) {
+    case SCHEME_BEARER:
+	return tunnel_auth_bearer(ctx, cred, ep, out);
+    case SCHEME_MAC:
+	return tunnel_auth_mac(ctx, cred, ep, out);
+    case SCHEME_OAUTH:
+	return tunnel_auth_oauth(ctx, cred, ep, out);
+    default:
+	return OAC_FAIL;
+    }
+
+    return OAC_FAIL;
+}
+/*
+ *
+ */
+#define TUNNEL_AUTH_FMT_PRELUDE "GET %s HTTP/1.1\r\n" \
+                                "Host: %s\r\n" \
+                                "User: %s\r\n"
+/*
+ *
+ */
+int tunnel_auth_prelude(struct oaclient_ctx *ctx,
+			struct oaclient_credential *cred,
+			struct oaclient_endpoint *ep,
+			char **out)
+{
+    const char *name = oaclient_endpoint_get_username(ep);
+    const char *host = oaclient_endpoint_get_hostname(ep);
+    const char *path = oaclient_endpoint_get_path(ep);
+    int  port = oaclient_endpoint_get_port(ep);
+
+    char hostbuf[256], *outp;
+    const char *hostp;
+
+
+    if ((!out) || !name || !host || port < 0)
+	return OAC_FAIL;
+
+    *out = NULL;
+
+    if (NULL == path || !path[0]) {
+	path = "/";
+    }
+
+    if (port == 0) {
+	hostp = host;
+    } else {
+	hostp = hostbuf;
+	if (sizeof(hostbuf) == snprintf(hostbuf, sizeof(hostbuf), "%s:%d", host, port))
+	    return OAC_FAIL;
+    }
+
+    asprintf(&outp, TUNNEL_AUTH_FMT_PRELUDE, path, hostp, name);
+    if (NULL == outp)
+        return OAC_NOMEM;
+
+    *out = outp;
+    return OAC_OK;
+}
+
+
+#define TUNNEL_AUTH_FMT_URL "http://%s%s"
+/*
+ *
+ */
+int tunnel_auth_fmt_url(struct oaclient_ctx *ctx,
+			struct oaclient_credential *cred,
+			struct oaclient_endpoint *ep,
+			char **out)
+{
+    const char *host = oaclient_endpoint_get_hostname(ep);
+    const char *path = oaclient_endpoint_get_path(ep);
+    int  port = oaclient_endpoint_get_port(ep);
+
+    char hostbuf[256], *outp;
+    const char *hostp;
+
+
+    if ((!out) || !host || port < 0)
+	return OAC_FAIL;
+
+    *out = NULL;
+
+    if (NULL == path || !path[0]) {
+	path = "/";
+    }
+
+    if (port == 0) {
+	hostp = host;
+    } else {
+	hostp = hostbuf;
+	if (sizeof(hostbuf) == snprintf(hostbuf, sizeof(hostbuf), "%s:%d", host, port))
+	    return OAC_FAIL;
+    }
+
+    asprintf(&outp, TUNNEL_AUTH_FMT_URL, hostp, path);
+    if (NULL == outp)
+        return OAC_NOMEM;
+
+    *out = outp;
+    return OAC_OK;
+}
+/*
+ *
+ */
+int tunnel_convert_post_to_auth(char **postdata) 
+{
+    char *this, *that, *here, *new;
+    this = *postdata;
+    int count=0, len=strlen(this);
+
+    //  count the number of variables.
+    for (here = this; here; here = strchr(here, '=')) {
+	here++;
+	count++;
+    }
+    if (!count) return OAC_OK;
+    
+    // magic number 3 is for the 2 quotes and the space added for each item.
+    len += count * 3;
+    new = malloc(len+1);
+    
+    if (NULL == new)
+	return OAC_NOMEM;
+
+    for (this = *postdata, that = new, count = 0; count < len; count++) {
+	switch (*this) {
+	case '=':
+	    *that++ = *this++;
+	    *that++ = '"';
+	    break;
+	case '&':
+	    *that++ = '"';
+	    *that++ = ',';
+	    this++;
+	    break;
+	case '\0':
+	    *that++ = '"';
+	    *that++ = '\0';
+	    count = len;
+	    break;
+	default:
+	    *that++ = *this++;
+	}
+    }
+    free(*postdata);
+    *postdata = new;
+    return OAC_OK;
+}
+
+/*
+ *
+ */
+#define TUNNEL_AUTH_FMT_AUTHHDR "%sAuthorization: %s %s\r\n" \
+                                "\r\n" 
+/**
+ * tunnel_auth_bearer
+ *
+ * Generates the HTTP payload to access a resource with a 
+ * bearer token.
+ */
+int tunnel_auth_bearer(struct oaclient_ctx *ctx,
+		       struct oaclient_credential *cred,
+		       struct oaclient_endpoint *ep,
+		       char **out)
+{
+    char *outp, *prelude;
+    int result;
+
+    const char *token = oaclient_credential_get_token(cred);
+ 
+    if (!out) 
+	return OAC_FAIL;
+
+    *out = NULL;
+
+    if (OAC_OK != (result = tunnel_auth_prelude(ctx, cred, ep, &prelude)))
+	return result;
+
+    asprintf(&outp, TUNNEL_AUTH_FMT_AUTHHDR, prelude, 
+	     SUPPORTED_SCHEMES[SCHEME_BEARER], token);
+    if (outp) {
+	*out = outp;
+    } else {
+	result = OAC_NOMEM;
+    }
+
+    free(prelude);
+    return OAC_OK;
+}
+
+/*
+ *
+ */
+#define TUNNEL_AUTH_FMT_BEARER "%sAuthorization: bearer %s\r\n" \
+                               "\r\n" 
+/**
+ * tunnel_auth_oauth
+ *
+ * Generates the HTTP payload to access a resource with a signed
+ * OAuth 1.0a style access request for a protected resource.
+ */
+int tunnel_auth_oauth(struct oaclient_ctx *ctx,
+		      struct oaclient_credential *cred,
+		      struct oaclient_endpoint *ep,
+		      char **out)
+{
+    char *outp=NULL, *prelude=NULL, *postargs=NULL;
+    char *url=NULL, *resulturl=NULL;
+    int result;
+
+    const char *token = oaclient_credential_get_token(cred);
+    const char *secret = oaclient_credential_get_secret(cred);
+
+    if (!out)
+        return OAC_FAIL;
+
+    *out = NULL;
+
+    if (OAC_OK != (result = tunnel_auth_fmt_url(ctx, cred, ep, &url)))
+        return result;
+
+    if (OAC_OK != (result = tunnel_auth_prelude(ctx, cred, ep, &prelude)))
+        return result;
+
+    resulturl = oauth_sign_url2(url, &postargs, OA_HMAC, "GET",
+				ydn_consumer_key, ydn_consumer_secret,
+				token, secret);
+
+    if (NULL == resulturl)
+	result = OAC_FAIL;
+
+    /* convert the postargs into Auth header format */
+    result = tunnel_convert_post_to_auth(&postargs);
+    if (OAC_OK != result)
+	return result;
+	
+
+    /* now format the result */
+    asprintf(&outp, TUNNEL_AUTH_FMT_AUTHHDR, prelude, 
+	     SUPPORTED_SCHEMES[SCHEME_OAUTH], postargs);
+
+    if (outp) {
+        *out = outp;
+    } else {
+        result = OAC_NOMEM;
+    }
+
+    /* cleanup and return */
+    free(prelude);
+    free(url);
+    free(postargs);
+    free(resulturl);
+    return result;
+}
+
+/**
+ * tunnel_auth_mac
+ *
+ * Generates the HTTP payload to access a resource with a signed
+ * MAC style authentication.
+ */
+int tunnel_auth_mac(struct oaclient_ctx *ctx,
+		    struct oaclient_credential *cred,
+		    struct oaclient_endpoint *ep,
+		    char **out)
+{
+    return OAC_FAIL;
+}
+
+
